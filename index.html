@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>간단 팀 추첨 및 카드 뽑기(선택형-규칙수정)</title>
+    <!-- Tailwind CSS CDN 로드 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 커스텀 스타일 및 폰트 설정 */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+        }
+        .card {
+            cursor: pointer;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            user-select: none;
+            border-radius: 12px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            padding: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            height: 100%;
+        }
+        .card:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+    </style>
+    <script>
+        // 포지션 기본 설정 (4-4-2 포메이션 + 꽝 1장)
+        const DEFAULT_POSITIONS = {
+            GK: 1, // 골키퍼
+            DEF: 4, // 수비수
+            MID: 4, // 미드필더
+            FWD: 2, // 공격수
+            DUD: 1, // 꽝 (Miss) 항목 추가
+        };
+
+        let positionSettings = { ...DEFAULT_POSITIONS };
+        let draftPool = []; // Available assignments (Team/Position)
+        let currentTeamRosters = []; // Publicly revealed assignments ({name, team, position})
+        let nextPlayerIndex = 1;
+        
+        let currentOptions = []; // The 1, 2, or 3 cards currently drawn for selection
+        let drawCount = 0; // Number of cards the current player draws
+        let activeNumTeams = 0; // 현재 활성화된 팀 수 (1팀 또는 2팀)
+
+        // --------------------------------------------------
+        // 유틸리티 함수
+        // --------------------------------------------------
+
+        // 배열 셔플 (Fisher-Yates 알고리즘)
+        const shuffleArray = (array) => {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        };
+
+        // 커스텀 모달 함수 (선택 결과 확인용)
+        const alertModal = (message) => {
+            const modal = document.getElementById('custom-modal');
+            // HTML 태그가 포함된 메시지를 안전하게 처리하기 위해 innerHTML 사용
+            document.getElementById('modal-message').innerHTML = message; 
+            modal.classList.remove('hidden');
+        };
+        
+        window.closeModal = () => {
+             document.getElementById('custom-modal').classList.add('hidden');
+             // 모달 닫은 후 바로 다음 드로우 시작 버튼을 렌더링
+             renderControlPanel();
+        }
+
+        // 한국어 포지션 이름 반환
+        const getKoreanPositionName = (pos) => {
+            switch(pos) {
+                case 'GK': return '골키퍼';
+                case 'DEF': return '수비수';
+                case 'MID': return '미드필더';
+                case 'FWD': return '공격수';
+                case 'DUD': return '꽝'; // '꽝' 추가
+                default: return '기타';
+            }
+        };
+
+        /**
+         * 다음 플레이어가 뽑을 카드 수를 결정하는 로직 (사용자의 새로운 규칙 적용)
+         * * 규칙:
+         * - 2팀 이상: P1, P2 (3장) / P3 ~ P8 (2장) / 나머지 (1장)
+         * - 1팀: P1 (3장) / P2 ~ P4 (2장) / 나머지 (1장)
+         */
+        const getDrawCount = (numPlayersDrawn, totalPlayers) => {
+            let group3Size = 0; // 3장 뽑는 인원 수
+            let group2Size = 0; // 2장 뽑는 인원 수
+            
+            if (activeNumTeams >= 2) {
+                // 2팀 이상 규칙 적용 (P1, P2 = 3장; P3~P8 = 2장)
+                group3Size = 2; // P1, P2
+                group2Size = 6; // P3 ~ P8 (총 6명)
+            } else if (activeNumTeams === 1) {
+                // 1팀 규칙 적용 (P1 = 3장; P2~P4 = 2장)
+                group3Size = 1; // P1
+                group2Size = 3; // P2 ~ P4 (총 3명)
+            }
+            
+            // 1. 3-Card Group (P1, or P1, P2)
+            if (numPlayersDrawn < group3Size) {
+                return 3;
+            }
+            
+            // 2. 2-Card Group (다음 3명 또는 6명)
+            const twoCardStartIdx = group3Size;
+            const twoCardEndIdx = twoCardStartIdx + group2Size; 
+
+            if (numPlayersDrawn >= twoCardStartIdx && numPlayersDrawn < twoCardEndIdx) {
+                return 2;
+            }
+
+            // 3. 1-Card Group (Remaining players)
+            return 1;
+        };
+
+
+        // --------------------------------------------------
+        // UI 생성 및 설정 로직
+        // --------------------------------------------------
+
+        // 포지션 설정 UI 생성
+        const initializePositionSettings = () => {
+            const container = document.getElementById('position-settings-container');
+            container.innerHTML = '';
+            
+            // 포지션 순서: GK, DEF, MID, FWD, DUD (꽝)
+            const orderedKeys = ['GK', 'DEF', 'MID', 'FWD', 'DUD']; 
+
+            orderedKeys.forEach(pos => {
+                const settingDiv = document.createElement('div');
+                settingDiv.className = 'flex items-center justify-between p-2 bg-gray-50 rounded-lg';
+                
+                // '꽝' 항목은 텍스트를 다르게 표시
+                const labelText = pos === 'DUD' ? '꽝' : `${pos} (${getKoreanPositionName(pos)})`;
+
+                settingDiv.innerHTML = `
+                    <label for="pos-${pos}" class="text-sm font-medium text-gray-700 w-1/2">${labelText}</label>
+                    <input type="number" id="pos-${pos}" value="${positionSettings[pos] || 0}" min="0" class="w-1/3 p-2 border border-gray-300 rounded-lg text-center text-gray-800" onchange="updatePositionCount('${pos}', this.value)">
+                `;
+                container.appendChild(settingDiv);
+            });
+            updateTotalPlayersNeeded();
+        };
+
+        // 포지션 수 업데이트
+        window.updatePositionCount = (pos, value) => {
+            const count = parseInt(value);
+            if (!isNaN(count) && count >= 0) {
+                positionSettings[pos] = count;
+                updateTotalPlayersNeeded();
+            }
+        };
+
+        // 필요한 총 선수 수 업데이트
+        const updateTotalPlayersNeeded = () => {
+            const total = Object.values(positionSettings).reduce((sum, count) => sum + count, 0);
+            document.getElementById('total-players-needed').textContent = total;
+            updateButtonTotals();
+        };
+        
+        // 버튼 텍스트의 총 인원수 업데이트
+        const updateButtonTotals = () => {
+             const total = Object.values(positionSettings).reduce((sum, count) => sum + count, 0);
+             document.getElementById('total-players-needed-1').textContent = total;
+             document.getElementById('total-players-needed-2').textContent = total * 2;
+        };
+        
+
+        // --------------------------------------------------
+        // 팀 추첨 및 카드 생성 로직
+        // --------------------------------------------------
+
+        const startDraft = (numTeams) => {
+            // 초기화
+            draftPool = [];
+            currentTeamRosters = [];
+            nextPlayerIndex = 1;
+            currentOptions = []; 
+            activeNumTeams = numTeams; // 활성화된 팀 수 저장
+            
+            const totalPlayersPerTeam = Object.values(positionSettings).reduce((sum, count) => sum + count, 0);
+            const requiredTotalPlayers = totalPlayersPerTeam * numTeams;
+
+            if (totalPlayersPerTeam === 0) {
+                alertModal("포지션별 인원수를 1명 이상으로 설정해주세요.");
+                return;
+            }
+            
+            // 1. 전체 포지션 슬롯 생성
+            let posAssignments = [];
+            for (let i = 1; i <= numTeams; i++) {
+                const teamName = `팀 ${i}`;
+                for (const [pos, count] of Object.entries(positionSettings)) {
+                    for (let j = 0; j < count; j++) {
+                        // 모든 포지션(DUD 포함)을 각 팀에 할당하여 풀을 생성
+                        posAssignments.push({ team: teamName, position: pos }); 
+                    }
+                }
+            }
+
+            // 2. 전체 할당 목록을 섞어서 드래프트 풀에 저장
+            draftPool = shuffleArray(posAssignments);
+
+            // 3. UI 업데이트
+            renderRosters();
+            renderControlPanel(); // 다음 드로우 시작 버튼 렌더링
+        };
+        
+        window.startDraftOneTeam = () => startDraft(1);
+        window.startDraftTwoTeams = () => startDraft(2);
+        
+        
+        // --------------------------------------------------
+        // 카드 선택 옵션 드로우
+        // --------------------------------------------------
+        
+        window.startPlayerDraw = () => {
+            if (draftPool.length === 0) {
+                document.getElementById('draw-status-message').textContent = `모든 ${currentTeamRosters.length}명의 추첨이 완료되었습니다!`;
+                renderControlPanel(); 
+                return;
+            }
+
+            const totalPlayers = currentTeamRosters.length + draftPool.length;
+            const playersDrawn = currentTeamRosters.length; // 0부터 시작
+
+            // 1. Draw Count 결정
+            drawCount = getDrawCount(playersDrawn, totalPlayers);
+            if (draftPool.length < drawCount) {
+                drawCount = draftPool.length; // 남은 카드 수가 적을 경우 조정
+            }
+
+            // 2. draftPool에서 카드 드로우하여 currentOptions에 저장
+            currentOptions = [];
+            for (let i = 0; i < drawCount; i++) {
+                // 맨 앞의 카드를 뽑아옴 (draftPool은 이미 셔플되어 있으므로 무작위 효과)
+                const drawnCard = draftPool.splice(0, 1)[0]; 
+                currentOptions.push(drawnCard);
+            }
+
+            // 3. (추가 로직) Draw Count가 1인 경우, 자동 확정 처리
+            if (drawCount === 1) {
+                // 0번 인덱스 카드를 자동 선택하고, renderRosters와 alertModal이 selectAssignment 내에서 호출됨.
+                window.selectAssignment(0); 
+                
+                // 모달이 뜬 후, closeModal에서 renderControlPanel()을 호출하므로, 여기서는 별도의 렌더링/메시지 업데이트는 생략하고 return
+                return;
+            }
+
+            // 4. (기존 로직 - 2장 또는 3장일 경우) 선택 카드 렌더링
+            renderCardOptions();
+            
+            document.getElementById('draw-status-message').innerHTML = `
+                <span class="text-blue-600 font-bold">플레이어 ${nextPlayerIndex}</span>님 차례입니다. ${drawCount}장의 카드 중 <span class="text-red-600 font-extrabold">하나</span>를 선택하세요!
+            `;
+        };
+        
+        // --------------------------------------------------
+        // 선택된 카드 처리 (선택 완료)
+        // --------------------------------------------------
+
+        window.selectAssignment = (selectedIndexStr) => {
+            const selectedIndex = parseInt(selectedIndexStr);
+            
+            if (isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= currentOptions.length) return;
+            
+            const chosenAssignment = currentOptions[selectedIndex];
+            
+            // 1. 선택된 할당을 로스터에 추가
+            const revealedAssignment = {
+                name: `플레이어 ${nextPlayerIndex++}`,
+                team: chosenAssignment.team,
+                position: chosenAssignment.position
+            };
+            currentTeamRosters.push(revealedAssignment);
+            
+            // 2. 선택되지 않은 카드들은 draftPool에 반환
+            currentOptions.forEach((option, index) => {
+                if (index !== selectedIndex) {
+                    draftPool.push(option); // 풀에 반환
+                }
+            });
+            
+            // 3. 옵션 클리어 및 풀 셔플
+            currentOptions = [];
+            draftPool = shuffleArray(draftPool); // 반환된 카드를 섞어 무작위성을 유지
+            
+            // 4. UI 업데이트
+            renderRosters();
+            
+            // 선택 결과 모달로 피드백
+            let modalMessage;
+
+            if (chosenAssignment.position === 'DUD') {
+                 // '꽝' 카드 선택 시 특별 메시지
+                 modalMessage = `${revealedAssignment.name}님이 <span class="font-extrabold text-red-700">💥 꽝</span>을 뽑았습니다! (남은 카드: ${draftPool.length}장) 이제 다음 플레이어가 추첨합니다.`;
+            } else {
+                 modalMessage = `${revealedAssignment.name}님이 '${revealedAssignment.team}'의 '${getKoreanPositionName(revealedAssignment.position)}' 포지션을 선택했습니다! (남은 카드: ${draftPool.length}장)`;
+            }
+            
+            if (drawCount === 1) {
+                // 1장 확정일 때의 메시지
+                if (chosenAssignment.position === 'DUD') {
+                     modalMessage = `${revealedAssignment.name}님에게 <span class="font-extrabold text-red-700">💥 꽝</span>이 <span class="font-extrabold text-red-600">자동으로 확정</span>되었습니다! (남은 카드: ${draftPool.length}장)`;
+                } else {
+                     modalMessage = `${revealedAssignment.name}님에게 '${revealedAssignment.team}'의 '${getKoreanPositionName(revealedAssignment.position)}' 포지션이 <span class="font-extrabold text-red-600">자동으로 확정</span>되었습니다! (남은 카드: ${draftPool.length}장)`;
+                }
+            }
+
+            alertModal(modalMessage);
+        };
+
+
+        // --------------------------------------------------
+        // 렌더링 함수
+        // --------------------------------------------------
+        
+        // 카드를 뽑은 후 선택할 옵션들을 렌더링
+        const renderCardOptions = () => {
+            const cardPickerEl = document.getElementById('card-picker');
+            cardPickerEl.innerHTML = '';
+            
+            // 현재 선택할 수 있는 카드 옵션 렌더링
+            currentOptions.forEach((option, index) => {
+                const cardEl = document.createElement('div');
+                
+                const isDud = option.position === 'DUD';
+                const cardBgClass = isDud ? 'bg-gray-300 text-gray-700' : 'bg-yellow-400 text-gray-800 hover:bg-yellow-500';
+                
+                cardEl.className = `card ${cardBgClass} rounded-xl shadow-lg flex-col justify-between h-32`;
+                cardEl.onclick = (e) => window.selectAssignment(index);
+
+                cardEl.innerHTML = `
+                    <p class="text-xs font-semibold text-gray-700">${isDud ? '벌칙/재추첨' : '선택 카드'} ${index + 1}</p>
+                    <div class="text-xl font-extrabold flex items-center justify-center h-full">
+                        ${option.team} / ${getKoreanPositionName(option.position)} ${isDud ? '💥' : ''}
+                    </div>
+                `;
+                cardPickerEl.appendChild(cardEl);
+            });
+            
+            // 카드 수를 기반으로 그리드 컬럼 설정 (최대 3개)
+            let gridColsClass = '';
+            if (currentOptions.length === 1) {
+                gridColsClass = 'grid-cols-1 md:grid-cols-1';
+            } else if (currentOptions.length === 2) {
+                gridColsClass = 'grid-cols-1 md:grid-cols-2';
+            } else { // 3장 이상
+                gridColsClass = 'grid-cols-1 sm:grid-cols-3 md:grid-cols-3';
+            }
+
+            // `card-picker` 요소의 클래스를 동적으로 업데이트
+            cardPickerEl.className = `grid gap-4 min-h-[150px] items-start ${gridColsClass}`;
+        };
+
+        // 메인 컨트롤 패널 (추첨 시작 버튼 또는 완료 메시지) 렌더링
+        const renderControlPanel = () => {
+            const cardPickerEl = document.getElementById('card-picker');
+            cardPickerEl.innerHTML = '';
+            
+            // `card-picker`의 그리드 클래스를 기본 상태로 재설정
+            cardPickerEl.className = `grid grid-cols-1 sm:grid-cols-3 md:grid-cols-5 gap-4 min-h-[150px] items-start`;
+
+            // 1. 선택 옵션이 렌더링 중이면 여기서 빠져나감
+            if (currentOptions.length > 0) {
+                renderCardOptions(); 
+                return;
+            }
+
+            // 2. 모든 드래프트가 완료된 경우
+            if (draftPool.length === 0 && currentTeamRosters.length > 0) {
+                document.getElementById('draw-status-message').textContent = `모든 ${currentTeamRosters.length}명의 추첨이 완료되었습니다!`;
+                cardPickerEl.innerHTML = `<div class="bg-green-100 p-4 rounded-xl text-center text-green-800 font-semibold col-span-full">모든 선수 할당 완료!</div>`;
+                return;
+            }
+            
+            // 3. 드래프트 설정이 필요한 경우 (초기 상태)
+            if (draftPool.length === 0 && currentTeamRosters.length === 0) {
+                document.getElementById('draw-status-message').textContent = `왼쪽에서 포지션을 설정하고 '카드 생성' 버튼을 눌러 추첨을 준비하세요.`;
+                cardPickerEl.innerHTML = `<p class="text-lg text-gray-500 text-center py-10 col-span-full">대기 중...</p>`;
+                return;
+            }
+            
+            // 4. 다음 드로우 준비 상태 (Start Draw 버튼 렌더링)
+            
+            const totalPlayers = currentTeamRosters.length + draftPool.length;
+            const playersDrawn = currentTeamRosters.length;
+            
+            // 남은 카드가 drawCount보다 적으면 조정된 drawCount 사용
+            const nextDrawCount = Math.min(getDrawCount(playersDrawn, totalPlayers), draftPool.length);
+            
+            const nextPlayerName = `플레이어 ${currentTeamRosters.length + 1}`;
+            
+            document.getElementById('draw-status-message').innerHTML = `
+                <span class="text-blue-600 font-bold">${nextPlayerName}</span>님 차례입니다. (총 인원 ${totalPlayers}명 중 ${playersDrawn + 1}번째)
+            `;
+
+            let buttonSubtext = ``;
+            if (nextDrawCount === 1) {
+                 // 1장 확정 그룹
+                 buttonSubtext = `<p class="mt-1 text-sm">(카드가 자동으로 확정됩니다.)</p>`;
+            } else {
+                 // 2장 또는 3장 선택 그룹
+                 buttonSubtext = `<p class="mt-1 text-sm">(${nextDrawCount}장의 카드를 뽑아 선택합니다.)</p>`;
+            }
+
+
+            cardPickerEl.innerHTML = `
+                <button onclick="window.startPlayerDraw()" class="w-full bg-red-600 text-white font-semibold py-4 rounded-xl hover:bg-red-700 transition duration-300 shadow-xl col-span-full">
+                    <span class="text-3xl font-extrabold">${nextPlayerName} 추첨 시작!</span>
+                    ${buttonSubtext}
+                </button>
+            `;
+        };
+
+        const renderRosters = () => {
+            const resultsContainer = document.getElementById('results-container');
+            resultsContainer.innerHTML = '';
+            
+            const numTeams = Math.max(...currentTeamRosters.map(r => parseInt(r.team.split(' ')[1])) || [0], 0);
+            const teamColors = ['bg-red-600', 'bg-blue-600']; 
+            
+            // 팀별로 로스터 분류
+            const teams = {};
+            for (let i = 1; i <= numTeams; i++) {
+                teams[`팀 ${i}`] = [];
+            }
+            
+            // currentTeamRosters는 이미 뽑은 순서대로 저장되어 있으므로,
+            // 이 순서대로 각 팀 로스터에 추가하면 뽑은 순서가 유지됩니다.
+            currentTeamRosters.forEach(p => {
+                if (teams[p.team]) {
+                    teams[p.team].push(p);
+                }
+            });
+
+            // 결과 영역 렌더링
+            Object.values(teams).forEach((teamRoster, teamIndex) => {
+                const teamName = `팀 ${teamIndex + 1}`;
+                const teamColorClass = teamColors[teamIndex % teamColors.length];
+                
+                const teamEl = document.createElement('div');
+                teamEl.className = `${numTeams === 1 ? 'lg:col-span-2' : 'lg:col-span-1'} bg-white p-6 rounded-xl shadow-lg border-t-8 ${teamColorClass.replace('bg-', 'border-')}`;
+                
+                // teamRoster 배열은 이미 currentTeamRosters에서 순차적으로 복사되었기 때문에,
+                // 이 상태 그대로 렌더링하면 뽑은 순서가 유지됩니다.
+                
+                teamEl.innerHTML = `
+                    <h3 class="text-3xl font-extrabold text-gray-800 mb-6">${teamName} 명단</h3>
+                    <h4 class="text-xl font-bold mt-2 mb-3 border-b pb-1 text-gray-700">로스터 목록 (${teamRoster.length}명)</h4>
+                    <ul class="space-y-1">
+                        ${teamRoster.map(p => {
+                            const isDud = p.position === 'DUD';
+                            const bgColor = isDud ? 'bg-gray-700' : teamColorClass; // Use dark gray for DUD
+                            const positionText = getKoreanPositionName(p.position);
+                            const listItemClass = isDud ? 'bg-red-100 border border-red-400' : 'bg-gray-50';
+
+                            return `
+                                <li class="p-2 ${listItemClass} rounded-md flex justify-between items-center">
+                                    <span class="font-semibold text-gray-800">${p.name}</span>
+                                    <span class="text-sm font-bold text-white px-2 py-0.5 rounded-full ${bgColor}">
+                                        ${positionText} ${isDud ? '💥' : ''}
+                                    </span>
+                                </li>
+                            `;
+                        }).join('')}
+                    </ul>
+                `;
+                resultsContainer.appendChild(teamEl);
+            });
+            
+            // 결과가 없을 경우 초기 메시지 표시
+            if (currentTeamRosters.length === 0 && draftPool.length === 0) {
+                resultsContainer.innerHTML = `<div class="lg:col-span-2 bg-white p-6 rounded-xl shadow-lg"><p class="text-lg text-gray-500 text-center py-10">왼쪽에서 포지션을 설정하고 추첨 버튼을 눌러 카드를 생성하세요.</p></div>`;
+            }
+        };
+
+
+        // --------------------------------------------------
+        // 초기화 및 이벤트 리스너
+        // --------------------------------------------------
+        window.onload = () => {
+            initializePositionSettings();
+            renderControlPanel(); // 초기 화면 렌더링
+        };
+
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen p-4 sm:p-8">
+    <header class="text-center mb-8">
+        <h1 class="text-4xl font-extrabold text-gray-900 tracking-tight">⭐ 랜덤 팀 & 포지션 카드 뽑기(선택형)</h1>
+        <p class="mt-2 text-lg text-gray-600">**[새 규칙 적용]** 2팀 이상: P1, P2 (3장) / P3~P8 (2장) / 나머지 (1장) | 1팀: P1 (3장) / P2~P4 (2장) / 나머지 (1장)</p>
+    </header>
+
+    <main class="grid grid-cols-1 lg:grid-cols-3 gap-8 max-w-7xl mx-auto">
+
+        <!-- 왼쪽 섹션: 설정 및 실행 -->
+        <section class="lg:col-span-1 bg-white p-6 rounded-xl shadow-2xl h-fit sticky top-8">
+            <h2 class="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">1. 포지션별 인원 설정</h2>
+            
+            <div id="position-settings-container" class="space-y-2 mb-4">
+                <!-- 포지션 설정 인풋이 여기에 로드됩니다 -->
+            </div>
+            
+            <p class="text-lg font-semibold text-gray-800 border-t pt-3">팀당 총 인원: <span id="total-players-needed" class="text-blue-600">12</span>명</p>
+
+            <h2 class="text-2xl font-bold text-gray-800 mt-6 mb-4 border-b pb-2">2. 카드 생성 및 추첨 실행</h2>
+            
+            <div class="space-y-3">
+                <button onclick="window.startDraftOneTeam()" class="w-full bg-indigo-600 text-white font-semibold py-3 rounded-lg hover:bg-indigo-700 transition duration-300 shadow-md hover:shadow-lg">
+                    1팀 추첨 카드 생성 (총 <span id="total-players-needed-1" class="font-bold">12</span>장)
+                </button>
+                <button onclick="window.startDraftTwoTeams()" class="w-full bg-green-600 text-white font-semibold py-3 rounded-lg hover:bg-green-700 transition duration-300 shadow-md hover:shadow-lg">
+                    2팀 추첨 카드 생성 (총 <span id="total-players-needed-2" class="font-bold">24</span>장)
+                </button>
+            </div>
+        </section>
+
+        <!-- 오른쪽 섹션: 카드 뽑기 및 결과 리스트 -->
+        <section class="lg:col-span-2 space-y-8">
+            <h2 class="text-2xl font-bold text-gray-800 border-b pb-2">3. 카드 뽑기 영역</h2>
+            <p id="draw-status-message" class="text-lg text-gray-600">왼쪽에서 '카드 생성' 버튼을 눌러 추첨을 준비하세요.</p>
+            
+            <!-- 카드 영역 -->
+            <div id="card-picker" class="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-5 gap-4 min-h-[150px] items-start">
+                <!-- 카드들이 여기에 로드됩니다 -->
+            </div>
+            
+            <!-- 결과 명단 영역 -->
+            <h2 class="text-2xl font-bold text-gray-800 border-b pb-2 mt-8">4. 추첨 결과 명단</h2>
+            <div id="results-container" class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- 추첨 결과가 여기에 로드됩니다 -->
+            </div>
+        </section>
+
+    </main>
+
+    <!-- 커스텀 모달 (경고/오류 메시지) -->
+    <div id="custom-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 class="text-xl font-bold text-red-600 mb-4">선택 결과</h3>
+            <p id="modal-message" class="text-gray-700 mb-4"></p>
+            <button onclick="window.closeModal()" class="w-full bg-red-600 text-white font-semibold py-2 rounded-lg hover:bg-red-700 transition duration-300">
+                다음 추첨 진행
+            </button>
+        </div>
+    </div>
+</body>
+</html>
